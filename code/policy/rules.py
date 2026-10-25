@@ -1,0 +1,54 @@
+"""Policy rules and action mappings for GhostTrace AI."""
+from typing import Dict, Any
+
+# Required action for each data category under deletion_rules.csv
+CATEGORY_ACTION_MAP: Dict[str, str] = {
+    "USER_PROFILE": "DELETE",
+    "SECONDARY_IDENTIFIER": "DELETE",
+    "SEARCH_INDEX_ENTRY": "DELETE",
+    "CACHE_ENTRY": "DELETE",
+    "SUPPORT_MESSAGE": "REDACT",
+    "SUPPORT_ATTACHMENT": "DELETE",
+    "ANALYTICS_PROFILE": "ANONYMIZE",
+    "PRODUCT_TELEMETRY": "ANONYMIZE",
+    "USER_EXPORT": "DELETE",
+    "MARKETING_PROFILE": "DELETE",
+    "EMAIL_DELIVERY_LOG": "REDACT",
+    "SECURITY_AUDIT_LOG": "RETAIN",
+    "LEGAL_HOLD_RECORD": "RETAIN",
+    "BACKUP_ARCHIVE": "RETAIN",
+    "ACCOUNT_TOMBSTONE": "REDACT",
+    "DATA_FLOW": "DISABLE",
+}
+
+# Phase ordering
+PHASE_ORDER = {
+    "FINDING": 1,
+    "REMEDIATION": 2,
+    "VERIFICATION": 3,
+}
+
+# Operation ordering within each phase
+FINDING_OP_ORDER = {
+    "REPORT_REMAINING_RECORD": 1,
+    "REPORT_EXPOSED_PII": 2,
+    "REPORT_ACTIVE_DATA_FLOW": 3,
+    "REPORT_RESTORE_RISK": 4,
+}
+
+REMEDIATION_OP_ORDER = {
+    "DISABLE_DATA_FLOW": 1,
+    "BLOCK_RESTORE": 2,
+    "DELETE_RECORD": 3,
+    "REDACT_RECORD": 4,
+    "ANONYMIZE_RECORD": 5,
+}
+
+VERIFICATION_OP_ORDER = {
+    "VERIFY_RECORD_ABSENT": 1,
+    "VERIFY_RECORD_PRESENT": 2,
+    "VERIFY_RECORD_REDACTED": 3,
+    "VERIFY_RECORD_ANONYMIZED": 4,
+    "VERIFY_DATA_FLOW_DISABLED": 5,
+    "VERIFY_RESTORE_BLOCKED": 6,
+}
