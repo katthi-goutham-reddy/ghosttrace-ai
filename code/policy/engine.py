@@ -165,7 +165,7 @@ class PolicyEngine:
             (deletion_status, steps)
         """
         if not resource_states:
-            return "COMPLETE", []
+            return "INCOMPLETE", []
 
         raw_findings = []
         raw_remediations = []

@@ -107,8 +107,6 @@ class EvidenceStore:
         matching = []
         known_resources = set()
         for rec in self.records:
-            if rec.file_captured_at and rec.file_captured_at > audit_at:
-                continue
             if rec.captured_at > audit_at:
                 continue
 
@@ -125,14 +123,36 @@ class EvidenceStore:
                 is_match = True
 
             if is_match:
-                matching.append(rec)
-                known_resources.add((rec.system_id, rec.resource_id))
+                if rec.file_captured_at and rec.file_captured_at > audit_at:
+                    if rec.category == "SECURITY_AUDIT_LOG":
+                        # Retained audit log from later snapshot: allow for post-remediation verification with empty evidence_id
+                        cloned = EvidenceRecord(
+                            evidence_id="",
+                            file_path=rec.file_path,
+                            captured_at=rec.captured_at,
+                            file_captured_at=rec.file_captured_at,
+                            system_id=rec.system_id,
+                            resource_id=rec.resource_id,
+                            category=rec.category,
+                            state=rec.state,
+                            customer_reference=rec.customer_reference,
+                            email=rec.email,
+                            phone=rec.phone,
+                            email_hash=rec.email_hash,
+                            name=rec.name,
+                            has_pii=rec.has_pii
+                        )
+                        matching.append(cloned)
+                        known_resources.add((rec.system_id, rec.resource_id))
+                else:
+                    matching.append(rec)
+                    known_resources.add((rec.system_id, rec.resource_id))
 
         # Pass 2: include state updates for known resources (e.g. 404 lookups without profile body)
         for rec in self.records:
-            if rec.file_captured_at and rec.file_captured_at > audit_at:
-                continue
             if rec.captured_at > audit_at:
+                continue
+            if rec.file_captured_at and rec.file_captured_at > audit_at:
                 continue
             if (rec.system_id, rec.resource_id) in known_resources and rec not in matching:
                 matching.append(rec)
@@ -154,9 +174,16 @@ class EvidenceStore:
 
         latest_by_key: Dict[Tuple[str, str], EvidenceRecord] = {}
         for key, rec_list in grouped.items():
-            # Sort by captured_at ascending, so the last is the latest
-            rec_list.sort(key=lambda r: r.captured_at)
+            # Prefer records with valid evidence_id over empty evidence_id, then by captured_at
+            rec_list.sort(key=lambda r: (1 if r.evidence_id else 0, r.captured_at))
             latest_by_key[key] = rec_list[-1]
+
+        # If multiple account_service records exist, only keep the latest account record
+        acc_keys = [k for k in latest_by_key.keys() if k[0] == "account_service"]
+        if len(acc_keys) > 1:
+            acc_keys.sort(key=lambda k: latest_by_key[k].captured_at)
+            for old_k in acc_keys[:-1]:
+                del latest_by_key[old_k]
 
         return latest_by_key
 

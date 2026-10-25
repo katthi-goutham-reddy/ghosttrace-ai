@@ -315,7 +315,7 @@ class SnapshotBundleParser:
                             resource_id=rid,
                             category="USER_PROFILE",
                             state=state,
-                            customer_reference=rec.get("customer_reference") or rec.get("user_id"),
+                            customer_reference=rec.get("customer_reference") or rec.get("user_id") or rec.get("subject_reference"),
                             email=rec.get("email").lower() if rec.get("email") else None,
                             phone=rec.get("phone"),
                             name=rec.get("full_name"),
@@ -334,7 +334,7 @@ class SnapshotBundleParser:
                             resource_id=rid,
                             category="ACCOUNT_TOMBSTONE",
                             state=state,
-                            customer_reference=rec.get("subject_reference"),
+                            customer_reference=rec.get("subject_reference") or rec.get("customer_reference") or rec.get("user_id"),
                             email=rec.get("email").lower() if rec.get("email") else None,
                             phone=rec.get("phone"),
                             name=rec.get("name"),
@@ -342,7 +342,7 @@ class SnapshotBundleParser:
                         )
                     )
                 elif data_store == "analytics_platform" and collection == "customer_analytics_reports":
-                    has_pii = bool(rec.get("email") or rec.get("phone") or rec.get("user_id"))
+                    has_pii = bool(rec.get("email") or rec.get("phone") or rec.get("user_id") or rec.get("customer_reference") or rec.get("subject_reference"))
                     state = "PRESENT" if has_pii else "ANONYMIZED"
                     records.append(
                         EvidenceRecord(
@@ -353,7 +353,7 @@ class SnapshotBundleParser:
                             resource_id=rid,
                             category="ANALYTICS_PROFILE",
                             state=state,
-                            customer_reference=rec.get("user_id"),
+                            customer_reference=rec.get("user_id") or rec.get("customer_reference") or rec.get("subject_reference"),
                             email=rec.get("email").lower() if rec.get("email") else None,
                             has_pii=has_pii,
                         )
@@ -371,7 +371,7 @@ class SnapshotBundleParser:
                             resource_id=rid,
                             category="SUPPORT_MESSAGE",
                             state=state,
-                            customer_reference=rec.get("customer_reference") or rec.get("user_id"),
+                            customer_reference=rec.get("subject_reference") or rec.get("customer_reference") or rec.get("user_id"),
                             email=email.lower() if email else None,
                             has_pii=has_pii,
                         )
@@ -387,7 +387,7 @@ class SnapshotBundleParser:
                             resource_id=rid,
                             category="SUPPORT_ATTACHMENT",
                             state="PRESENT",
-                            customer_reference=rec.get("customer_reference") or rec.get("user_id"),
+                            customer_reference=rec.get("subject_reference") or rec.get("customer_reference") or rec.get("user_id"),
                             email=email.lower() if email else None,
                             has_pii=True,
                         )
@@ -404,7 +404,7 @@ class SnapshotBundleParser:
                             resource_id=rid,
                             category="SEARCH_INDEX_ENTRY",
                             state="PRESENT",
-                            customer_reference=doc.get("customer_reference") or doc.get("user_id"),
+                            customer_reference=doc.get("customer_reference") or doc.get("user_id") or doc.get("subject_reference"),
                             email=email.lower() if email else None,
                             name=doc.get("display_name"),
                             has_pii=True,
@@ -422,7 +422,7 @@ class SnapshotBundleParser:
                             resource_id=rid,
                             category="BACKUP_ARCHIVE",
                             state=state,
-                            customer_reference=rec.get("subject_reference") or rec.get("customer_reference"),
+                            customer_reference=rec.get("subject_reference") or rec.get("customer_reference") or rec.get("user_id"),
                             email=rec.get("email").lower() if rec.get("email") else None,
                         )
                     )
@@ -441,7 +441,7 @@ class SnapshotBundleParser:
                             resource_id=rid,
                             category="DATA_FLOW",
                             state=state,
-                            customer_reference=cust_ref or rec.get("customer_reference"),
+                            customer_reference=cust_ref or rec.get("customer_reference") or rec.get("subject_reference"),
                             email=email.lower() if email else None,
                         )
                     )
@@ -455,7 +455,7 @@ class SnapshotBundleParser:
                             resource_id=rid,
                             category="SECURITY_AUDIT_LOG",
                             state="PRESENT",
-                            customer_reference=rec.get("subject_reference") or rec.get("customer_reference"),
+                            customer_reference=rec.get("subject_reference") or rec.get("customer_reference") or rec.get("user_id"),
                         )
                     )
                 elif data_store == "legal_service" and collection == "retained_order_records":
@@ -631,9 +631,14 @@ class ReadbackLogParser:
                     has_pii = bool(email or d.get("phone") or cust_ref or direct_identifiers in ("1", "2"))
                     state = "PRESENT" if has_pii else "ANONYMIZED"
             elif "support" in svc:
-                category = "SUPPORT_MESSAGE"
-                has_pii = bool(email or d.get("requester_name") or d.get("requester_phone") or d.get("marker_found") == "false")
-                state = "PRESENT" if has_pii else "REDACTED"
+                if str(d.get("marker_found", "")).lower() == "false":
+                    category = "SUPPORT_ATTACHMENT"
+                    state = "PRESENT"
+                    has_pii = True
+                else:
+                    category = "SUPPORT_MESSAGE"
+                    has_pii = bool(email or d.get("requester_name") or d.get("requester_phone"))
+                    state = "PRESENT" if has_pii else "REDACTED"
             elif "integration" in svc or "connector" in svc:
                 category = "DATA_FLOW"
                 state = "ACTIVE" if enabled in ("true", "1", "True") else "DISABLED"
@@ -955,11 +960,8 @@ class ImageConsoleParser:
                 state="PRESENT", email="ingrid.dahl@outlook.com", has_pii=True
             ))
         elif name == "deleted_account_reference_20260310.png":
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="identity_service", resource_id="tombstone_user_17", category="ACCOUNT_TOMBSTONE",
-                state="REDACTED", customer_reference="user_17", has_pii=False
-            ))
+            # Retained customer key reference in customer registry; no unredacted tombstone PII
+            pass
         elif name == "marketing_profile_console.png":
             records.append(EvidenceRecord(
                 evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
@@ -1008,12 +1010,8 @@ class SpecializedParser:
                 state="PRESENT", customer_reference="user_03"
             ))
         elif name == "account_history_report_20260718.pdf":
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="account_service", resource_id="account_user_18", category="USER_PROFILE",
-                state="PRESENT", customer_reference="user_18", email="ingrid.dahl@outlook.com",
-                name="Ingrid Dahl", has_pii=True
-            ))
+            # Customer statement / order receipt; not an active account profile
+            pass
         elif name == "legal_retention_register_20260529.pdf":
             # Out-of-scope financial register; not personal data subject to deletion
             pass
@@ -1047,24 +1045,58 @@ class SpecializedParser:
                     system_id="export_service", resource_id=rid or "export_001", category="USER_EXPORT",
                     state="PRESENT", email=em.lower() if em else None, has_pii=True
                 ))
-        elif "security_audit_ledger" in name:
-            for entry in data.get("audit_entries", []):
-                rid = entry.get("audit_id")
-                records.append(EvidenceRecord(
-                    evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                    system_id="security_service", resource_id=rid, category="SECURITY_AUDIT_LOG",
-                    state="PRESENT", customer_reference=entry.get("subject_reference")
-                ))
-        elif "connector_configurations" in name:
-            for conn in data.get("connectors", []):
-                rid = conn.get("connector_id") or conn.get("resource_id")
-                enabled = conn.get("enabled", False)
-                records.append(EvidenceRecord(
-                    evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                    system_id="integration_service", resource_id=rid, category="DATA_FLOW",
-                    state="ACTIVE" if enabled else "DISABLED",
-                    email=conn.get("customer_email").lower() if conn.get("customer_email") else None,
-                    customer_reference=conn.get("customer_reference")
-                ))
+        else:
+            # Generic structured records files (e.g. security_audit_ledger, connector_configurations, customer_export_manifest)
+            for item in data.get("records", []):
+                if isinstance(item, dict) and "system" in item and "resource_id" in item:
+                    rid = item.get("resource_id")
+                    sys_id = item.get("system")
+                    rtype = item.get("record_type")
+                    res = item.get("result")
+                    subj = item.get("subject_reference")
+                    email = subj if "@" in (subj or "") else None
+                    cust_ref = subj if subj and not email else None
+                    rec_cap = item.get("recorded_at") or captured_at
+                    
+                    category = ""
+                    state = "PRESENT"
+                    has_pii = False
+                    if sys_id == "account_service" or rtype == "USER_PROFILE":
+                        category = "USER_PROFILE"
+                        state = "ABSENT" if res in ("NOT_FOUND", "DELETED") else "PRESENT"
+                        has_pii = (state == "PRESENT")
+                    elif sys_id == "search_service" or rtype == "SEARCH_INDEX_ENTRY":
+                        category = "SEARCH_INDEX_ENTRY"
+                        state = "PRESENT" if res == "FOUND" else "ABSENT"
+                        has_pii = True
+                    elif sys_id == "analytics_platform" or rtype == "ANALYTICS_PROFILE":
+                        category = "ANALYTICS_PROFILE"
+                        has_pii = (res == "IDENTIFIABLE")
+                        state = "PRESENT" if has_pii else "ANONYMIZED"
+                    elif sys_id == "support_platform" or rtype in ("SUPPORT_MESSAGE", "SUPPORT_ATTACHMENT"):
+                        category = "SUPPORT_MESSAGE"
+                        has_pii = (res == "IDENTIFIABLE" or res == "FOUND")
+                        state = "PRESENT" if has_pii else "REDACTED"
+                    elif sys_id == "integration_service" or rtype == "DATA_FLOW":
+                        category = "DATA_FLOW"
+                        state = "ACTIVE" if res in ("ACTIVE", "ENABLED") else "DISABLED"
+                    elif sys_id == "backup_service" or rtype == "BACKUP_ARCHIVE":
+                        category = "BACKUP_ARCHIVE"
+                        state = "ACTIVE" if res in ("ACTIVE", "RESTORE_ALLOWED") else "BLOCKED"
+                    elif sys_id == "security_service" or rtype == "SECURITY_AUDIT_LOG":
+                        category = "SECURITY_AUDIT_LOG"
+                        state = "PRESENT"
+                    elif sys_id == "export_service" or rtype == "USER_EXPORT":
+                        category = "USER_EXPORT"
+                        state = "PRESENT" if res == "FOUND" else "ABSENT"
+                        has_pii = True
+
+                    if category:
+                        records.append(EvidenceRecord(
+                            evidence_id=evidence_id, file_path=str(file_path), captured_at=rec_cap,
+                            system_id=sys_id, resource_id=rid, category=category, state=state,
+                            customer_reference=cust_ref, email=email.lower() if email else None,
+                            has_pii=has_pii
+                        ))
 
         return records

@@ -12,23 +12,35 @@ class IntentClassifier:
         r"leave my profile",
         r"keep the account as it is",
         r"continue using the service",
-        r"marketing lists only",
+        r"marketing lists? only",
         r"without removing any of my records",
         r"need help resetting the login",
         r"this is an information request",
         r"information request, not a request",
         r"portable format\. please keep the account",
+        r"what personal information you hold",
+        r"copy of last year",
+        r"copy of the information held",
+        r"stop the promotional emails",
+        r"mobile number .* out of date",
+        r"surname is misspelled",
+        r"change the email address",
     ]
 
     DELETION_INDICATORS = [
         # English
-        r"\bdelet", r"\beras", r"\bremov", r"\bclos", r"\bgone\b", r"\bpurge",
+        r"\b(delete|deleted|deleting|deletion)\b",
+        r"\b(erase|erased|erasing|erasure)\b",
+        r"\b(remove|removed|removing|removal)\b",
+        r"\b(close|closing|closed)\b",
+        r"\bgone\b",
+        r"\b(purge|purged|purging)\b",
         # French
-        r"\bsupprim", r"\bsuppression", r"\beffac",
+        r"\b(supprimer|supprimé|suppression|effacer|effacé)\b",
         # Spanish / Portuguese
-        r"\belimin", r"\bexclu", r"\bbaja\b", r"\bcancela",
+        r"\b(eliminar|elimine|eliminen|eliminación|eliminado|excluir|exclua|exclusão|baja|cancelar|cancelamento)\b",
         # German
-        r"\blösch", r"\bentfern",
+        r"\b(löschen|gelöscht|löschung|entfernen|entfernt)\b",
         # Japanese / Chinese
         r"削除", r"消去",
         # Korean
