@@ -57,7 +57,17 @@ class AuditPipeline:
                 self.activities = list(csv.DictReader(f))
 
     def _init_account_lookups(self):
-        for r in self.store.records:
+        handover_ev_id = "evidence_03"
+        manifest_file = self.dataset_dir / "evidence_files.csv"
+        if manifest_file.exists():
+            with open(manifest_file, "r", encoding="utf-8") as mf:
+                for row in csv.DictReader(mf):
+                    if "customer_account_handover" in row.get("file_path", ""):
+                        handover_ev_id = row.get("file_id", "evidence_03")
+                        break
+
+        # Sort ascending by captured_at so the latest verified state takes precedence
+        for r in sorted(self.store.records, key=lambda x: x.captured_at):
             if r.system_id == "account_service" and r.resource_id:
                 if r.email:
                     self.acc_by_email[r.email.lower()] = (r.resource_id, r.evidence_id, r.captured_at)
@@ -73,14 +83,28 @@ class AuditPipeline:
                         if len(parts) >= 6:
                             rid = parts[2]
                             ident = parts[5]
+                            cap_time = parts[0].replace("- ", "").strip()
                             if "@" in ident:
-                                self.acc_by_email[ident.lower()] = (rid, "evidence_03", "2026-10-01T12:00:00Z")
+                                self.acc_by_email[ident.lower()] = (rid, handover_ev_id, cap_time)
                             elif ident.startswith("user_"):
-                                self.acc_by_user[ident] = (rid, "evidence_03", "2026-10-01T12:00:00Z")
+                                self.acc_by_user[ident] = (rid, handover_ev_id, cap_time)
+
+    def _find_evidence_id_at(self, audit_at: str) -> str:
+        manifest_file = self.dataset_dir / "evidence_files.csv"
+        if manifest_file.exists():
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                matching = []
+                for row in csv.DictReader(f):
+                    cap = row.get("captured_at", row.get("capture_time", ""))
+                    if cap and cap <= audit_at:
+                        matching.append((cap, row["file_id"]))
+                if matching:
+                    matching.sort(key=lambda x: x[0])
+                    return matching[-1][1]
+        return ""
 
     def _find_primary_account(
         self,
-        case_id: str,
         cluster: Optional[UserCluster],
         email: str,
         req_at: str,
@@ -91,76 +115,60 @@ class AuditPipeline:
         """
         Determines the primary account_service resource_id for this case.
         """
-        # 1. Direct user_id fallback for initial test cases (user_01..user_10 -> account_001..account_010)
-        if cluster and cluster.user_id:
-            num_str = cluster.user_id.replace("user_", "")
-            try:
-                num = int(num_str)
-                if num <= 10:
-                    return f"account_{num:03d}"
-            except ValueError:
-                pass
+        from datetime import datetime
 
-        # 2. Direct lookup from evidence / handover
+        # 1. Direct lookup from evidence / handover (latest captured_at wins)
         if email.lower() in self.acc_by_email:
             return self.acc_by_email[email.lower()][0]
-        if cluster and cluster.user_id and cluster.user_id in self.acc_by_user:
-            return self.acc_by_user[cluster.user_id][0]
+        if cluster:
+            for em in cluster.emails:
+                if em.lower() in self.acc_by_email:
+                    return self.acc_by_email[em.lower()][0]
+            if cluster.user_id and cluster.user_id in self.acc_by_user:
+                return self.acc_by_user[cluster.user_id][0]
 
-        # 3. Corroborate with system_activity deletion worker activities
-        from datetime import datetime
-        try:
-            dt_rep = datetime.fromisoformat(rep_at.replace("Z", "+00:00"))
-        except Exception:
-            return None
+        # 2. Correlate with system_activity deletion worker activities
+        if rep_at:
+            try:
+                dt_rep = datetime.fromisoformat(rep_at.replace("Z", "+00:00"))
+                window_accs = [
+                    a for a in self.activities
+                    if a["source_system"] == "deletion_worker"
+                    and a["target_system"] == "account_service"
+                    and a["event_type"] == "DELETE_RECORD"
+                    and -80 * 60 <= (datetime.fromisoformat(a["event_time"].replace("Z", "+00:00")) - dt_rep).total_seconds() <= 15 * 60
+                ]
+                if len(window_accs) == 1:
+                    return window_accs[0]["resource_id"]
+                elif len(window_accs) > 1:
+                    # Correlate with downstream worker activities in the same job
+                    if known_rids:
+                        matching_acts = [
+                            a for a in self.activities
+                            if a["source_system"] == "deletion_worker" and a["resource_id"] in known_rids
+                        ]
+                        if matching_acts:
+                            act_time = datetime.fromisoformat(matching_acts[0]["event_time"].replace("Z", "+00:00"))
+                            prec = [a for a in window_accs if datetime.fromisoformat(a["event_time"].replace("Z", "+00:00")) <= act_time]
+                            if prec:
+                                prec.sort(key=lambda a: (act_time - datetime.fromisoformat(a["event_time"].replace("Z", "+00:00"))).total_seconds())
+                                return prec[0]["resource_id"]
 
-        window_accs = [
-            a for a in self.activities
-            if a["source_system"] == "deletion_worker"
-            and a["target_system"] == "account_service"
-            and a["event_type"] == "DELETE_RECORD"
-            and -80 * 60 <= (datetime.fromisoformat(a["event_time"].replace("Z", "+00:00")) - dt_rep).total_seconds() <= 15 * 60
-        ]
+                    # Pick account closest to the standard deletion window
+                    target_time = dt_rep.timestamp() - 60 * 60
+                    window_accs.sort(key=lambda a: abs(datetime.fromisoformat(a["event_time"].replace("Z", "+00:00")).timestamp() - target_time))
+                    return window_accs[0]["resource_id"]
+            except Exception:
+                pass
 
-        if len(window_accs) == 1:
-            return window_accs[0]["resource_id"]
-        elif len(window_accs) > 1:
-            window_accs.sort(key=lambda a: datetime.fromisoformat(a["event_time"].replace("Z", "+00:00")))
-            if case_id == "case_18":
-                return "account_5521"
-            elif case_id == "case_20":
-                return "account_5037"
-            elif case_id == "case_21":
-                return "account_6440"
-            elif case_id == "case_22":
-                return "account_4990"
-            elif case_id == "case_23":
-                return "account_410"
-            elif case_id == "case_25":
-                return "account_3136"
-            elif case_id == "case_26":
-                return "account_5684"
-            elif case_id == "case_27":
-                return "account_3866"
-            elif case_id == "case_28":
-                return "account_5482"
-            elif case_id == "case_29":
-                return "account_7012"
-            elif case_id == "case_31":
-                return "account_4857"
-            elif case_id == "case_32":
-                return "account_8858"
-            else:
-                return window_accs[0]["resource_id"]
-
-        # 4. Standard fallback from user_id if available
+        # 3. Standard platform schema fallback from user_id
         if cluster and cluster.user_id:
             num_str = cluster.user_id.replace("user_", "")
-            try:
+            if num_str.isdigit():
                 num = int(num_str)
-                return f"account_{num:03d}"
-            except ValueError:
-                pass
+                if num < 1000:
+                    return f"account_{num:03d}"
+                return f"account_{num}"
 
         return None
 
@@ -210,29 +218,32 @@ class AuditPipeline:
                             state="PRESENT",
                             customer_reference=rec.customer_reference
                         )
+                        has_audit = True
                         break
 
-        if not any(k[0] == "security_service" for k in latest_states.keys()):
-            if case_id == "case_18":
-                latest_states[("security_service", "audit_record_6645")] = EvidenceRecord(
-                    evidence_id="",
-                    file_path="",
-                    captured_at=reported_at,
-                    system_id="security_service",
-                    resource_id="audit_record_6645",
-                    category="SECURITY_AUDIT_LOG",
-                    state="PRESENT"
-                )
-            elif case_id == "case_20":
-                latest_states[("security_service", "audit_record_5569")] = EvidenceRecord(
-                    evidence_id="",
-                    file_path="",
-                    captured_at=reported_at,
-                    system_id="security_service",
-                    resource_id="audit_record_5569",
-                    category="SECURITY_AUDIT_LOG",
-                    state="PRESENT"
-                )
+        if not has_audit and reported_at:
+            try:
+                dt_rep = datetime.fromisoformat(reported_at.replace("Z", "+00:00"))
+                # Correlate with deletion_worker audit records in system_activity
+                audit_acts = [
+                    a for a in self.activities
+                    if a["resource_id"].startswith("audit_record_")
+                    and -120 * 60 <= (datetime.fromisoformat(a["event_time"].replace("Z", "+00:00")) - dt_rep).total_seconds() <= 120 * 60
+                ]
+                if audit_acts:
+                    audit_acts.sort(key=lambda a: abs((datetime.fromisoformat(a["event_time"].replace("Z", "+00:00")) - dt_rep).total_seconds()))
+                    ev_id = self._find_evidence_id_at(audit_at)
+                    latest_states[("security_service", sec_rid)] = EvidenceRecord(
+                        evidence_id=ev_id,
+                        file_path="",
+                        captured_at=reported_at,
+                        system_id="security_service",
+                        resource_id=sec_rid,
+                        category="SECURITY_AUDIT_LOG",
+                        state="PRESENT"
+                    )
+            except Exception:
+                pass
 
         # Step 5: Anonymized analytics matching from worker activities
         has_analytics = any(k[0] == "analytics_platform" for k in latest_states.keys())
@@ -249,22 +260,17 @@ class AuditPipeline:
                     if a["target_system"] == "analytics_platform" and a["event_type"] == "ANONYMIZE_RECORD"
                 ]
                 if batch_analytics:
-                    target_a = None
-                    if case_id in ["case_03", "case_25", "case_27", "case_04", "case_21"]:
-                        target_a = batch_analytics[0]
-                    elif case_id in ["case_26", "case_28"]:
-                        target_a = batch_analytics[1] if len(batch_analytics) > 1 else batch_analytics[0]
-
-                    if target_a:
-                        for r in self.store.records:
-                            if (
-                                r.system_id == "analytics_platform"
-                                and r.resource_id == target_a["resource_id"]
-                                and r.captured_at <= audit_at
-                                and (not r.file_captured_at or r.file_captured_at <= audit_at)
-                            ):
-                                latest_states[("analytics_platform", r.resource_id)] = r
-                                break
+                    batch_analytics.sort(key=lambda a: abs((datetime.fromisoformat(a["event_time"].replace("Z", "+00:00")) - dt_rep).total_seconds()))
+                    target_a = batch_analytics[0]
+                    for r in self.store.records:
+                        if (
+                            r.system_id == "analytics_platform"
+                            and r.resource_id == target_a["resource_id"]
+                            and r.captured_at <= audit_at
+                            and (not r.file_captured_at or r.file_captured_at <= audit_at)
+                        ):
+                            latest_states[("analytics_platform", r.resource_id)] = r
+                            break
             except Exception:
                 pass
 
@@ -273,7 +279,6 @@ class AuditPipeline:
         if not has_account:
             known_rids = set(rid for (sys_id, rid) in latest_states.keys())
             acc_id = self._find_primary_account(
-                case_id=case_id,
                 cluster=cluster,
                 email=email,
                 req_at=requested_at,
@@ -295,7 +300,7 @@ class AuditPipeline:
                 if acc_ev_rec:
                     latest_states[("account_service", acc_id)] = acc_ev_rec
                 else:
-                    ev_id = "evidence_94" if case_id == "case_03" else ("evidence_54" if case_id <= "case_10" else ("evidence_92" if case_id <= "case_30" else "evidence_51"))
+                    ev_id = self._find_evidence_id_at(audit_at)
                     latest_states[("account_service", acc_id)] = EvidenceRecord(
                         evidence_id=ev_id,
                         file_path="",

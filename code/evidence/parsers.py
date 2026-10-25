@@ -1,9 +1,22 @@
+import base64
 import json
+import logging
+import os
 import re
 import sqlite3
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+import requests
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 from .models import EvidenceRecord
+
+logger = logging.getLogger(__name__)
 
 class HandoverParser:
     @staticmethod
@@ -909,111 +922,489 @@ class SqlDumpParser:
         conn.close()
         return records
 
-class ImageConsoleParser:
-    """Catalog of ground truth evidence transcribed from the 11 PNG screenshots."""
-    @staticmethod
-    def parse(file_path: Path, evidence_id: str, captured_at: str) -> List[EvidenceRecord]:
-        records = []
-        name = file_path.name
+def _clean_ocr_digits(val: str) -> str:
+    """Normalize common OCR character confusions in numeric suffixes."""
+    trans = str.maketrans({"O": "0", "o": "0", "l": "1", "I": "1", "S": "5", "s": "5"})
+    return val.translate(trans)
 
-        if name == "account_admin_console_20260926.png":
-            # Haruka Sato / user_11 / account_5762
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="account_service", resource_id="account_5762", category="USER_PROFILE",
-                state="PRESENT", customer_reference="user_11", email="haruka.s1838@zoho.com",
-                phone="+81 90 7610 2507", name="Haruka Sato", has_pii=True
-            ))
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="support_platform", resource_id="support_9538", category="SUPPORT_MESSAGE",
-                state="PRESENT", customer_reference="user_11", email="haruka.s1838@zoho.com", has_pii=True
-            ))
-        elif name == "analytics_profile_view_20260713.png":
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="analytics_platform", resource_id="analytics_7438", category="ANALYTICS_PROFILE",
-                state="PRESENT", customer_reference="user_20", email="darwish.omar@icloud.com",
-                name="Omar Darwish", has_pii=True
-            ))
-        elif name == "backup_restore_console_20260429.png":
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="backup_service", resource_id="backup_9287", category="BACKUP_ARCHIVE",
-                state="ACTIVE", email="areed1433@gmail.com"
-            ))
-        elif name == "connector_management_console_20260807.png":
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="integration_service", resource_id="data_flow_1121", category="DATA_FLOW",
-                state="ACTIVE", email="jain.aditi@gmail.com"
-            ))
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="integration_service", resource_id="data_flow_9846", category="DATA_FLOW",
-                state="ACTIVE", email="lucia-torres@gmail.com"
-            ))
-        elif name == "customer_export_console_20260618.png":
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="export_service", resource_id="export_1260", category="USER_EXPORT",
-                state="PRESENT", email="ingrid.dahl@outlook.com", has_pii=True
-            ))
-        elif name == "deleted_account_reference_20260310.png":
-            # Retained customer key reference in customer registry; no unredacted tombstone PII
-            pass
-        elif name == "marketing_profile_console.png":
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="marketing_service", resource_id="marketing_001", category="MARKETING_PROFILE",
-                state="PRESENT", email="sj.park@naver.com", phone="+82 10-5837-9451", name="Soo-jin Park", has_pii=True
-            ))
-        elif name == "search_index_inspector_20260901.png":
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="search_service", resource_id="search_428", category="SEARCH_INDEX_ENTRY",
-                state="PRESENT", customer_reference="user_13", email="g.silva76@gmail.com",
-                name="Gabriel Silva", has_pii=True
-            ))
-        elif name == "security_audit_explorer_20260905.png":
-            for i in range(1, 7):
+def _fix_resource_id(rid: str) -> str:
+    """Format and validate resource IDs with standard prefix_digits conventions."""
+    if "_" in rid:
+        prefix, suffix = rid.rsplit("_", 1)
+        return f"{prefix}_{_clean_ocr_digits(suffix)}"
+    return rid
+
+def _fix_email(em: str) -> str:
+    """Fix common OCR scanning errors in email addresses."""
+    em = re.sub(r"\s*@\s*", "@", em)
+    em = em.lower().replace(",", ".")
+    em = re.sub(r"\.c0m$", ".com", em)
+    em = re.sub(r"\.c0rn$", ".com", em)
+    em = re.sub(r"\.corn$", ".com", em)
+    em = re.sub(r"\.cor$", ".com", em)
+    return em
+
+IMAGE_STATUS_MAP = {
+    "PRESENT": "PRESENT",
+    "FOUND": "PRESENT",
+    "IDENTIFIABLE": "PRESENT",
+    "READY": "PRESENT",
+    "COLLECTING": "PRESENT",
+    "PACKAGING": "PRESENT",
+    "LIVE": "PRESENT",
+    "DELIVERED": "PRESENT",
+    "IN TRANSIT": "PRESENT",
+    "HEALTHY": "PRESENT",
+    "VALID": "PRESENT",
+    "ACTIVE": "ACTIVE",
+    "DISABLED": "DISABLED",
+    "STOPPED": "DISABLED",
+    "BLOCKED": "BLOCKED",
+    "ABSENT": "ABSENT",
+    "NOT_FOUND": "ABSENT",
+    "DELETED": "ABSENT",
+    "REDACTED": "REDACTED",
+    "ANONYMIZED": "ANONYMIZED",
+}
+
+def gemini_vision_fallback(file_path: Path) -> str:
+    """Fallback vision call using Gemini API if Tesseract fails, cached to .gemini_vision_cache.json."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        logger.info(f"GEMINI_API_KEY not configured in environment or .env; skipping vision fallback for {file_path}")
+        return ""
+
+    cache_path = Path(__file__).parent / ".gemini_vision_cache.json"
+    cache = {}
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+
+    key = str(file_path.resolve())
+    try:
+        mtime = file_path.stat().st_mtime
+    except Exception:
+        mtime = 0
+
+    if key in cache and cache[key].get("mtime") == mtime:
+        return cache[key].get("text", "")
+
+    try:
+        with open(file_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": "Transcribe all visible text exactly as displayed in this console screenshot without any commentary or Markdown formatting."},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": img_b64
+                        }
+                    }
+                ]
+            }]
+        }
+        resp = requests.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+
+        if text:
+            cache[key] = {
+                "mtime": mtime,
+                "text": text
+            }
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=2)
+            except Exception:
+                pass
+
+        return text
+    except Exception as e:
+        logger.warning(f"Gemini vision fallback failed for {file_path}: {e}")
+        return ""
+
+
+def ocr_image(file_path: Path) -> str:
+    """Performs OCR on an image file with grayscale and 2x Lanczos upscale, cached to .ocr_cache.json, with Gemini vision fallback."""
+    cache_path = Path(__file__).parent / ".ocr_cache.json"
+    cache = {}
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+
+    key = str(file_path.resolve())
+    try:
+        mtime = file_path.stat().st_mtime
+    except Exception:
+        mtime = 0
+
+    if key in cache and cache[key].get("mtime") == mtime:
+        return cache[key].get("text", "")
+
+    try:
+        from PIL import Image
+        import pytesseract
+
+        tess_bin = Path("tesseract_bin").resolve()
+        if (tess_bin / "tesseract.exe").exists():
+            pytesseract.pytesseract.tesseract_cmd = str(tess_bin / "tesseract.exe")
+            os.environ["TESSDATA_PREFIX"] = str(tess_bin / "tessdata")
+
+        img_orig = Image.open(file_path)
+        w, h = img_orig.size
+        img_prep = img_orig.convert("L").resize((w * 2, h * 2), Image.Resampling.LANCZOS)
+
+        txt6 = pytesseract.image_to_string(img_prep, config="--psm 6").strip()
+        txt4 = pytesseract.image_to_string(img_prep, config="--psm 4").strip()
+        best_txt = txt4 if len(txt4) > len(txt6) and "audit_record_" in txt4 else txt6
+
+        if not best_txt:
+            logger.info(f"Tesseract returned empty text for {file_path}; attempting Gemini vision fallback")
+            best_txt = gemini_vision_fallback(file_path)
+
+        if best_txt:
+            cache[key] = {
+                "mtime": mtime,
+                "text": best_txt
+            }
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=2)
+            except Exception:
+                pass
+
+        return best_txt
+    except Exception as e:
+        logger.warning(f"Local OCR failed for {file_path}: {e}. Attempting Gemini vision fallback.")
+        fallback_txt = gemini_vision_fallback(file_path)
+        if fallback_txt:
+            cache[key] = {
+                "mtime": mtime,
+                "text": fallback_txt
+            }
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=2)
+            except Exception:
+                pass
+            return fallback_txt
+        return ""
+
+
+class ImageConsoleParser:
+    """Parses evidence records from console screenshots using OCR and regex extraction."""
+    _EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+,-]+(?:\s*@\s*)[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
+    _PHONE_RE = re.compile(r"\+\d{1,3}[\d\s\-]{7,}\d")
+    _USER_REF_RE = re.compile(r"\buser[_\s](\d+)\b")
+
+    @classmethod
+    def parse(cls, file_path: Path, evidence_id: str, captured_at: str) -> List[EvidenceRecord]:
+        records: List[EvidenceRecord] = []
+        if not file_path.exists():
+            return records
+
+        text = ocr_image(file_path)
+        if not text:
+            logger.warning(f"OCR returned empty text or failed for {file_path}")
+            return records
+
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        full_text = " \n ".join(lines)
+
+        # 1. Integration Service / BridgeOps / Connector Management
+        if "BridgeOps" in full_text or re.search(r"\bdata_flow_\d+\b", full_text):
+            found_flows = set()
+            for line in lines:
+                m_df = re.search(r"\b(data_flow_\w+)\b", line)
+                m_em = cls._EMAIL_RE.search(line)
+                if m_df and m_em:
+                    df_id = _fix_resource_id(m_df.group(1))
+                    if df_id not in found_flows:
+                        found_flows.add(df_id)
+                        em = _fix_email(m_em.group(0))
+                        records.append(EvidenceRecord(
+                            evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                            system_id="integration_service", resource_id=df_id, category="DATA_FLOW",
+                            state="ACTIVE", email=em, has_pii=False
+                        ))
+
+        # 2. Customer Operations / Account Admin Console
+        elif "Customer Operations" in full_text or re.search(r"\baccount_\d+\b", full_text):
+            m_acc = re.search(r"\b(account_\w+)\b", full_text)
+            m_user = cls._USER_REF_RE.search(full_text)
+            m_email = cls._EMAIL_RE.search(full_text)
+            m_phone = cls._PHONE_RE.search(full_text)
+
+            name = None
+            for line in lines:
+                m_name = re.search(r"\|\s*[O0]\s+([A-Z][a-z]+ [A-Z][a-z]+)", line)
+                if m_name:
+                    name = m_name.group(1).strip()
+                    break
+
+            cust_ref = f"user_{m_user.group(1)}" if m_user else None
+            email = _fix_email(m_email.group(0)) if m_email else None
+            phone = m_phone.group(0).strip() if m_phone else None
+            acc_id = _fix_resource_id(m_acc.group(1)) if m_acc else None
+
+            if acc_id:
                 records.append(EvidenceRecord(
                     evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                    system_id="security_service", resource_id=f"audit_record_00{i}", category="SECURITY_AUDIT_LOG",
-                    state="PRESENT", customer_reference="user_03"
+                    system_id="account_service", resource_id=acc_id, category="USER_PROFILE",
+                    state="PRESENT", customer_reference=cust_ref, email=email,
+                    phone=phone, name=name, has_pii=True
                 ))
-        elif name == "support_ticket_console_20260524.png":
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="support_platform", resource_id="support_1034", category="SUPPORT_MESSAGE",
-                state="PRESENT", email="kagyeman8947@fastmail.com", name="Kofi Agyeman", has_pii=True
-            ))
+
+            m_supp = re.search(r"\b(support_\w+)\b", full_text)
+            if m_supp:
+                supp_id = _fix_resource_id(m_supp.group(1))
+                records.append(EvidenceRecord(
+                    evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                    system_id="support_platform", resource_id=supp_id, category="SUPPORT_MESSAGE",
+                    state="PRESENT", customer_reference=cust_ref, email=email, has_pii=True
+                ))
+
+        # 3. Pulse Analytics / Users
+        elif "Pulse Analytics" in full_text or re.search(r"\banalytics_\d+\b", full_text):
+            m_ana = re.search(r"\b(analytics_\w+)\b", full_text)
+            m_user = cls._USER_REF_RE.search(full_text)
+            m_email = cls._EMAIL_RE.search(full_text)
+            name = None
+            for line in lines:
+                m_name = re.search(r"^[U|O]\s+([A-Z][a-z]+ [A-Z][a-z]+)", line)
+                if m_name:
+                    name = m_name.group(1).strip()
+                    break
+
+            ana_id = _fix_resource_id(m_ana.group(1)) if m_ana else None
+            cust_ref = f"user_{m_user.group(1)}" if m_user else None
+            email = _fix_email(m_email.group(0)) if m_email else None
+
+            if ana_id:
+                records.append(EvidenceRecord(
+                    evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                    system_id="analytics_platform", resource_id=ana_id, category="ANALYTICS_PROFILE",
+                    state="PRESENT", customer_reference=cust_ref, email=email,
+                    name=name, has_pii=True
+                ))
+
+        # 4. Vault Recovery Manager / Backup
+        elif "Recovery Manager" in full_text or re.search(r"\bbackup_\d+\b", full_text):
+            found_backups = set()
+            for line in lines:
+                m_b = re.search(r"\b(backup_\w+)\b", line)
+                m_em = cls._EMAIL_RE.search(line)
+                if m_b and m_em:
+                    bid = _fix_resource_id(m_b.group(1))
+                    if bid not in found_backups:
+                        found_backups.add(bid)
+                        em = _fix_email(m_em.group(0))
+                        records.append(EvidenceRecord(
+                            evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                            system_id="backup_service", resource_id=bid, category="BACKUP_ARCHIVE",
+                            state="ACTIVE", email=em, has_pii=False
+                        ))
+            m_b_panel = re.search(r"Archives Updated moments ago\s*-\s*\d+\s*records\s+(backup_\w+)", full_text)
+            if m_b_panel:
+                bid = _fix_resource_id(m_b_panel.group(1))
+                if bid not in found_backups:
+                    found_backups.add(bid)
+                    m_em = cls._EMAIL_RE.search(full_text[m_b_panel.end():])
+                    em = _fix_email(m_em.group(0)) if m_em else None
+                    records.append(EvidenceRecord(
+                        evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                        system_id="backup_service", resource_id=bid, category="BACKUP_ARCHIVE",
+                        state="ACTIVE", email=em, has_pii=False
+                    ))
+
+        # 5. Customer Download Center / Exports
+        elif "Customer Download Center" in full_text or re.search(r"\bexport_\d+\b", full_text):
+            found_exports = set()
+            for line in lines:
+                m_exp = re.search(r"\b(export_\w+)\b", line)
+                m_em = cls._EMAIL_RE.search(line)
+                if m_exp and m_em:
+                    eid = _fix_resource_id(m_exp.group(1))
+                    if eid not in found_exports:
+                        found_exports.add(eid)
+                        em = _fix_email(m_em.group(0))
+                        records.append(EvidenceRecord(
+                            evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                            system_id="export_service", resource_id=eid, category="USER_EXPORT",
+                            state="PRESENT", email=em, has_pii=True
+                        ))
+
+        # 6. Audience Operations / Marketing
+        elif "Audience Operations" in full_text or re.search(r"\bmarketing_\d+\b", full_text):
+            m_mkt = re.search(r"\b(marketing_\w+)\b", full_text)
+            m_em = cls._EMAIL_RE.search(full_text)
+            m_phone = cls._PHONE_RE.search(full_text)
+            name = None
+            for line in lines:
+                m_name = re.search(r"([A-Za-z\-]+ [A-Za-z]+)\s+Live", line)
+                if m_name:
+                    name = m_name.group(1).strip()
+                    break
+
+            mid = _fix_resource_id(m_mkt.group(1)) if m_mkt else None
+            em = _fix_email(m_em.group(0)) if m_em else None
+            phone = m_phone.group(0).strip() if m_phone else None
+
+            if mid:
+                records.append(EvidenceRecord(
+                    evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                    system_id="marketing_service", resource_id=mid, category="MARKETING_PROFILE",
+                    state="PRESENT", email=em, phone=phone, name=name, has_pii=True
+                ))
+
+        # 7. Search Console / Inspector
+        elif "Search Console" in full_text or re.search(r"\bsearch_\d+\b", full_text):
+            found_search = set()
+            for line in lines:
+                m_s = re.search(r"\b(search_\w+)\b", line)
+                m_em = cls._EMAIL_RE.search(line)
+                if m_s and m_em:
+                    sid = _fix_resource_id(m_s.group(1))
+                    if sid not in found_search:
+                        found_search.add(sid)
+                        em = _fix_email(m_em.group(0))
+                        m_u = cls._USER_REF_RE.search(line)
+                        cust_ref = f"user_{m_u.group(1)}" if m_u else None
+                        m_n = re.search(rf"{re.escape(sid)}\s+([A-Z][a-z]+ [A-Z][a-z]+)", line)
+                        name = m_n.group(1).strip() if m_n else None
+                        records.append(EvidenceRecord(
+                            evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                            system_id="search_service", resource_id=sid, category="SEARCH_INDEX_ENTRY",
+                            state="PRESENT", customer_reference=cust_ref, email=em,
+                            name=name, has_pii=True
+                        ))
+
+        # 8. Sentinel / Security Audit
+        elif "Sentinel" in full_text or re.search(r"\baudit_record_\d+\b", full_text):
+            m_u = re.search(r"Subject filter:\s*user[_\s](\d+)", full_text)
+            cust_ref = f"user_{m_u.group(1)}" if m_u else None
+            found_audits = set()
+            for m_aud in re.finditer(r"\b(audit_record_\w+)\b", full_text):
+                arid = _fix_resource_id(m_aud.group(1))
+                if arid not in found_audits:
+                    found_audits.add(arid)
+                    records.append(EvidenceRecord(
+                        evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                        system_id="security_service", resource_id=arid, category="SECURITY_AUDIT_LOG",
+                        state="PRESENT", customer_reference=cust_ref, has_pii=False
+                    ))
+
+        # 9. Helpline Console / Support Ticket
+        elif "Helpline Console" in full_text or re.search(r"\bsupport_\d+\b", full_text):
+            m_supp = re.search(r"\b(support_\w+)\b", full_text)
+            m_em = cls._EMAIL_RE.search(full_text)
+            name = None
+            for line in lines:
+                m_n = re.search(r"support_\w+\s*-\s*([A-Z][a-z]+ [A-Z][a-z]+)", line)
+                if m_n:
+                    name = m_n.group(1).strip()
+                    break
+
+            sid = _fix_resource_id(m_supp.group(1)) if m_supp else None
+            em = _fix_email(m_em.group(0)) if m_em else None
+
+            if sid:
+                records.append(EvidenceRecord(
+                    evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                    system_id="support_platform", resource_id=sid, category="SUPPORT_MESSAGE",
+                    state="PRESENT", email=em, name=name, has_pii=True
+                ))
+
+        # 10. Customer Reference Registry (retained reference overview)
+        elif "Customer Reference Registry" in full_text or ("Customer references" in full_text and "Retained reference" in full_text):
+            pass
+
+        # 11. Object Storage Browser
+        elif "Object Storage" in full_text or "northstar-customer-data" in full_text:
+            found_objs = set()
+            for line in lines:
+                m_dc = re.search(r"\b(delivery_confirmation_(\d+))\.(pdf|jpg)\b", line)
+                if m_dc:
+                    rid = m_dc.group(1)
+                    if rid not in found_objs:
+                        found_objs.add(rid)
+                        records.append(EvidenceRecord(
+                            evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                            system_id="object_storage", resource_id=rid, category="SUPPORT_ATTACHMENT",
+                            state="PRESENT", has_pii=True
+                        ))
+                m_ret = re.search(r"\b(return_label_(\d+))\.(pdf|jpg)\b", line)
+                if m_ret:
+                    rid = m_ret.group(1)
+                    if rid not in found_objs:
+                        found_objs.add(rid)
+                        records.append(EvidenceRecord(
+                            evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                            system_id="object_storage", resource_id=rid, category="SUPPORT_ATTACHMENT",
+                            state="PRESENT", has_pii=True
+                        ))
+                m_exp = re.search(r"\b(customer_export_[\d-]+)\.zip\b", line)
+                if m_exp:
+                    rid = m_exp.group(1)
+                    if rid not in found_objs:
+                        found_objs.add(rid)
+                        records.append(EvidenceRecord(
+                            evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                            system_id="object_storage", resource_id=rid, category="USER_EXPORT",
+                            state="PRESENT", has_pii=True
+                        ))
+
+        if not records:
+            logger.warning(f"Could not extract recognizable records from OCR text of {file_path}")
 
         return records
+
 
 class SpecializedParser:
     @staticmethod
     def parse_pdf(file_path: Path, evidence_id: str, captured_at: str) -> List[EvidenceRecord]:
         records = []
-        name = file_path.name
-        if name == "delivery_correction_attachment.pdf":
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="support_platform", resource_id="support_001", category="SUPPORT_ATTACHMENT",
-                state="PRESENT", email="priya.raman@gmail.com", phone="+91 98765 73142",
-                name="Priya Raman", has_pii=True
-            ))
-        elif name == "security_retention_extract.pdf":
-            records.append(EvidenceRecord(
-                evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
-                system_id="security_service", resource_id="audit_record_003", category="SECURITY_AUDIT_LOG",
-                state="PRESENT", customer_reference="user_03"
-            ))
-        elif name == "account_history_report_20260718.pdf":
-            # Customer statement / order receipt; not an active account profile
-            pass
-        elif name == "legal_retention_register_20260529.pdf":
-            # Out-of-scope financial register; not personal data subject to deletion
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(str(file_path))
+            full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+            m_supp = re.search(r"\b(support_\d+)\b", full_text)
+            m_email = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", full_text)
+            m_phone = re.search(r"\+\d[\d\s\-]{8,}\d", full_text)
+            m_user = re.search(r"\b(user_\d+)\b", full_text)
+            m_audit = re.search(r"\b(audit_record_\d+)\b", full_text)
+
+            if "DELIVERY ADDRESS CORRECTION" in full_text.upper() or "ATTACHMENT" in full_text.upper():
+                rid = m_supp.group(1) if m_supp else "support_attachment"
+                em = m_email.group(0).lower() if m_email else None
+                phone = m_phone.group(0) if m_phone else None
+                name_match = re.search(r"Detail\s*\n\s*([A-Z][a-z]+ [A-Z][a-z]+)", full_text)
+                name = name_match.group(1).strip() if name_match else None
+                records.append(EvidenceRecord(
+                    evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                    system_id="support_platform", resource_id=rid, category="SUPPORT_ATTACHMENT",
+                    state="PRESENT", email=em, phone=phone, name=name, has_pii=True
+                ))
+            elif "COMPLIANCE JOURNAL" in full_text.upper() or "SECURITY" in full_text.upper():
+                if m_audit and m_user:
+                    records.append(EvidenceRecord(
+                        evidence_id=evidence_id, file_path=str(file_path), captured_at=captured_at,
+                        system_id="security_service", resource_id=m_audit.group(1), category="SECURITY_AUDIT_LOG",
+                        state="PRESENT", customer_reference=m_user.group(1)
+                    ))
+        except Exception:
             pass
         return records
 
